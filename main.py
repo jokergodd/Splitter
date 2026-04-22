@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
-from fastembed import SparseTextEmbedding
-from langchain_huggingface import HuggingFaceEmbeddings
-
 from rag_demo.chunking import ChunkingConfig
-from rag_demo.embeddings import CachedEmbeddings
-from rag_demo.pipeline import PipelineConfig, run_batch_pipeline, run_document_pipeline
-from rag_demo.storage import build_storage_backend
+from rag_demo.pipeline import PipelineConfig
+from runtime.container import get_ingest_runtime
+from services.ingest_service import IngestService
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,18 +52,6 @@ def _print_batch_summary(result) -> None:
             print(f"{file_name} error={file_result.error}")
 
 
-def _build_embeddings() -> CachedEmbeddings:
-    return CachedEmbeddings(
-        HuggingFaceEmbeddings(
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-        )
-    )
-
-
-def _build_sparse_embeddings():
-    return SparseTextEmbedding(model_name="Qdrant/bm25")
-
-
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -76,14 +62,13 @@ def main() -> int:
         file_path = Path(args.file)
         if not file_path.exists():
             raise FileNotFoundError(file_path)
-        embeddings = _build_embeddings()
-        sparse_embeddings = _build_sparse_embeddings()
-        storage_backend = build_storage_backend(sparse_embeddings=sparse_embeddings)
-        result = run_document_pipeline(
-            file_path,
-            PipelineConfig(chunking=ChunkingConfig()),
-            embeddings,
-            storage_backend=storage_backend,
+        runtime = get_ingest_runtime()
+        ingest_service = IngestService(runtime)
+        result = asyncio.run(
+            ingest_service.ingest_file(
+                file_path=file_path,
+                config=PipelineConfig(chunking=ChunkingConfig()),
+            )
         )
         _print_summary(result)
     else:
@@ -92,13 +77,12 @@ def main() -> int:
             raise FileNotFoundError(data_dir)
         if not data_dir.is_dir():
             raise NotADirectoryError(data_dir)
-        embeddings = _build_embeddings()
-        sparse_embeddings = _build_sparse_embeddings()
-        storage_backend = build_storage_backend(sparse_embeddings=sparse_embeddings)
-        result = run_batch_pipeline(
-            data_dir,
-            embeddings,
-            storage_backend=storage_backend,
+        runtime = get_ingest_runtime()
+        ingest_service = IngestService(runtime)
+        result = asyncio.run(
+            ingest_service.ingest_batch(
+                data_dir=data_dir,
+            )
         )
         _print_batch_summary(result)
     return 0

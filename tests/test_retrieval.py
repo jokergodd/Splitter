@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -170,3 +171,40 @@ def test_merge_hybrid_hits_keeps_highest_score_per_child_id():
 
     assert [hit.child_id for hit in merged] == ["child-2", "child-1", "child-3"]
     assert [hit.score for hit in merged] == [0.8, 0.6, 0.4]
+
+
+def test_query_hybrid_children_async_uses_async_qdrant_client():
+    class _AsyncFakeQdrantClient(_FakeQdrantClient):
+        async def query_points(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.response
+
+    response = SimpleNamespace(
+        points=[
+            SimpleNamespace(
+                id="point-1",
+                score=0.9,
+                payload={"child_id": "child-1", "text": "alpha"},
+            )
+        ]
+    )
+    client = _AsyncFakeQdrantClient(response=response)
+
+    hits = asyncio.run(
+        retrieval.query_hybrid_children_async(
+            client=client,
+            collection_name="child_chunks_hybrid",
+            query_text="hello",
+            embeddings=_FakeEmbeddings(),
+            sparse_embeddings=_FakeSparseEmbeddings(),
+            top_k=3,
+            candidate_limit=11,
+        )
+    )
+
+    assert len(hits) == 1
+    assert hits[0].child_id == "child-1"
+    assert client.calls[0]["prefetch"] == [
+        Prefetch(query=[5.0, 0.25], using="dense", limit=11),
+        Prefetch(query=SparseVector(indices=[1, 3], values=[0.5, 5.0]), using="sparse", limit=11),
+    ]

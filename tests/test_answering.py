@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from langchain_core.documents import Document
@@ -13,6 +14,12 @@ class _FakeLLM:
         self.calls: list[str] = []
 
     def invoke(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        return self.response
+
+
+class _FakeAsyncLLM(_FakeLLM):
+    async def ainvoke(self, prompt: str) -> str:
         self.calls.append(prompt)
         return self.response
 
@@ -201,3 +208,92 @@ def test_answer_query_accepts_llm_message_objects(monkeypatch):
     )
 
     assert result.answer == "最终答案"
+
+
+def test_answer_query_async_uses_async_rewrite_retrieval_and_llm(monkeypatch):
+    llm = _FakeAsyncLLM("最终答案")
+    calls: list[tuple[str, object]] = []
+
+    rewrite_result = SimpleNamespace(
+        original_query="原始问题",
+        rewritten_queries=["原始问题", "候选改写一"],
+    )
+    candidate_hits = [
+        answering.HybridRetrievalHit(
+            child_id="child-2",
+            score=0.8,
+            payload={"parent_id": "parent-2", "child_id": "child-2", "text": "child-two"},
+            point_id="point-2",
+        )
+    ]
+    reranked_documents = [
+        Document(
+            page_content="child-two",
+            metadata={"parent_id": "parent-2", "child_id": "child-2", "rerank_score": 0.9},
+        )
+    ]
+    parent_chunks = [
+        Document(
+            page_content="parent-two",
+            metadata={
+                "parent_id": "parent-2",
+                "source": "docs/parent-two.md",
+                "file_path": "/tmp/parent-two.md",
+            },
+        )
+    ]
+
+    async def fake_rewrite_queries_async(original_query, llm, max_queries=4):
+        calls.append(("rewrite_queries_async", original_query))
+        return rewrite_result
+
+    async def fake_query_hybrid_children_for_queries_async(**kwargs):
+        calls.append(("query_hybrid_children_for_queries_async", list(kwargs["query_texts"])))
+        return candidate_hits
+
+    async def fake_fetch_parent_chunks_async(parent_ids, mongo_repository):
+        calls.append(("fetch_parent_chunks_async", parent_ids))
+        return parent_chunks
+
+    def fake_rerank_candidates(original_query, candidates, reranker, limit=10):
+        calls.append(("rerank_candidates", original_query))
+        return reranked_documents
+
+    monkeypatch.setattr(answering, "rewrite_queries_async", fake_rewrite_queries_async)
+    monkeypatch.setattr(
+        answering,
+        "query_hybrid_children_for_queries_async",
+        fake_query_hybrid_children_for_queries_async,
+    )
+    monkeypatch.setattr(answering, "fetch_parent_chunks_async", fake_fetch_parent_chunks_async)
+    monkeypatch.setattr(answering, "rerank_candidates", fake_rerank_candidates)
+    monkeypatch.setattr(
+        answering,
+        "build_answer_prompt",
+        lambda original_query, parent_chunks: calls.append(("build_answer_prompt", original_query))
+        or "PROMPT",
+    )
+
+    result = asyncio.run(
+        answering.answer_query_async(
+            original_query="原始问题",
+            llm=llm,
+            client=SimpleNamespace(),
+            collection_name="child_chunks_hybrid",
+            embeddings=SimpleNamespace(),
+            sparse_embeddings=SimpleNamespace(),
+            mongo_repository=SimpleNamespace(),
+            reranker=SimpleNamespace(),
+        )
+    )
+
+    assert result.answer == "最终答案"
+    assert result.rewritten_queries == ["原始问题", "候选改写一"]
+    assert llm.calls == ["PROMPT"]
+    assert calls == [
+        ("rewrite_queries_async", "原始问题"),
+        ("query_hybrid_children_for_queries_async", ["原始问题", "候选改写一"]),
+        ("rerank_candidates", "原始问题"),
+        ("fetch_parent_chunks_async", ["parent-2"]),
+        ("build_answer_prompt", "原始问题"),
+    ]

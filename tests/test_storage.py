@@ -656,14 +656,30 @@ def test_build_storage_backend_uses_local_mongo_and_qdrant_defaults(monkeypatch)
             captured["qdrant_check_compatibility"] = check_compatibility
             captured["qdrant_trust_env"] = trust_env
 
+    class _FakeAsyncMongoClientCtor(_FakeMongoClientCtor):
+        def __init__(self, uri: str):
+            super().__init__(uri)
+            captured["async_mongo_uri"] = uri
+
+    class _FakeAsyncQdrantClientCtor(_FakeQdrantClientCtor):
+        def __init__(self, url: str, check_compatibility: bool, trust_env: bool):
+            super().__init__(url, check_compatibility, trust_env)
+            captured["async_qdrant_url"] = url
+
     monkeypatch.setattr(storage, "MongoClient", _FakeMongoClientCtor)
+    monkeypatch.setattr(storage, "AsyncMongoClient", _FakeAsyncMongoClientCtor)
     monkeypatch.setattr(storage, "QdrantClient", _FakeQdrantClientCtor)
+    monkeypatch.setattr(storage, "AsyncQdrantClient", _FakeAsyncQdrantClientCtor)
 
     backend = storage.build_storage_backend(sparse_embeddings=object())
 
     assert captured["mongo_uri"] == "mongodb://admin:123456@localhost:27017"
+    assert captured["async_mongo_uri"] == "mongodb://admin:123456@localhost:27017"
     assert captured["qdrant_url"] == "http://localhost:6333"
+    assert captured["async_qdrant_url"] == "http://localhost:6333"
     assert captured["qdrant_check_compatibility"] is False
     assert captured["qdrant_trust_env"] is False
     assert backend.mongo_repository.database_name == "splitter"
+    assert backend.mongo_repository.async_client is not None
     assert backend.qdrant_store.collection_name == "child_chunks_hybrid"
+    assert backend.qdrant_store.async_client is not None

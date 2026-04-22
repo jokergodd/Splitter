@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,16 @@ class PipelineResult:
     status: str = "ok"
     content_hash: str | None = None
     skip_reason: str | None = None
+
+
+@dataclass(slots=True)
+class PreparedPipelineResult:
+    path: Path
+    content_hash: str
+    raw_page_count: int
+    cleaned_page_count: int
+    parent_chunks: list[Document]
+    child_chunks: list[Document]
 
 
 _RECOVERABLE_BATCH_ERRORS = (
@@ -144,6 +155,117 @@ def run_document_pipeline(
     )
 
 
+def prepare_document_pipeline(
+    file_path: str | Path,
+    config: PipelineConfig,
+    embeddings,
+) -> PreparedPipelineResult:
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    embeddings = _ensure_cached_embeddings(embeddings)
+    content_hash = compute_content_hash(path)
+    raw_documents = load_documents(path)
+    if not raw_documents:
+        raise RuntimeError(f"No documents were loaded from {path}.")
+
+    cleaned_documents = clean_documents(raw_documents)
+    if not cleaned_documents:
+        raise RuntimeError(f"Cleaning removed all documents from {path}.")
+
+    chunk_result: ChunkingResult = build_parent_child_chunks(
+        cleaned_documents,
+        config.chunking,
+        embeddings,
+    )
+    return PreparedPipelineResult(
+        path=path,
+        content_hash=content_hash,
+        raw_page_count=len(raw_documents),
+        cleaned_page_count=len(cleaned_documents),
+        parent_chunks=chunk_result.parent_chunks,
+        child_chunks=chunk_result.child_chunks,
+    )
+
+
+async def run_document_pipeline_async(
+    file_path: str | Path,
+    config: PipelineConfig,
+    embeddings,
+    storage_backend=None,
+) -> PipelineResult:
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    embeddings = _ensure_cached_embeddings(embeddings)
+    content_hash = compute_content_hash(path)
+    if storage_backend and await storage_backend.mongo_repository.should_skip_hash_async(content_hash):
+        return PipelineResult(
+            raw_page_count=0,
+            cleaned_page_count=0,
+            parent_chunks=[],
+            child_chunks=[],
+            status="skipped",
+            content_hash=content_hash,
+            skip_reason="content hash already exists",
+        )
+
+    if storage_backend:
+        await storage_backend.mongo_repository.mark_processing_async(
+            content_hash=content_hash,
+            file_path=path,
+            file_type=path.suffix.lower(),
+            file_size=path.stat().st_size,
+        )
+
+    try:
+        prepared = await asyncio.to_thread(
+            prepare_document_pipeline,
+            path,
+            config,
+            embeddings,
+        )
+
+        if storage_backend:
+            parent_ids = await storage_backend.mongo_repository.store_parent_chunks_async(
+                content_hash=prepared.content_hash,
+                file_type=path.suffix.lower(),
+                parent_chunks=prepared.parent_chunks,
+            )
+            await storage_backend.qdrant_store.store_child_chunks_async(
+                content_hash=prepared.content_hash,
+                child_chunks=prepared.child_chunks,
+                embeddings=embeddings,
+                sparse_embeddings=storage_backend.sparse_embeddings,
+            )
+            await storage_backend.mongo_repository.mark_completed_async(
+                content_hash=prepared.content_hash,
+                raw_page_count=prepared.raw_page_count,
+                cleaned_page_count=prepared.cleaned_page_count,
+                parent_chunk_count=len(prepared.parent_chunks),
+                child_chunk_count=len(prepared.child_chunks),
+                parent_ids=parent_ids,
+            )
+    except Exception as exc:
+        if storage_backend:
+            await storage_backend.mongo_repository.mark_failed_async(
+                content_hash=content_hash,
+                error=str(exc),
+            )
+        raise
+
+    return PipelineResult(
+        raw_page_count=prepared.raw_page_count,
+        cleaned_page_count=prepared.cleaned_page_count,
+        parent_chunks=prepared.parent_chunks,
+        child_chunks=prepared.child_chunks,
+        status="ok",
+        content_hash=prepared.content_hash,
+    )
+
+
 def discover_pdf_files(directory: str | Path) -> list[Path]:
     return [
         file_path
@@ -181,6 +303,62 @@ def run_batch_pipeline(
     for file_path in supported_files:
         try:
             pipeline_result = run_document_pipeline(
+                file_path,
+                PipelineConfig(chunking=pipeline_config.chunking),
+                embeddings,
+                storage_backend=storage_backend,
+            )
+        except _RECOVERABLE_BATCH_ERRORS as exc:
+            file_results.append(
+                FileProcessingResult(
+                    file_path=file_path,
+                    status="failed",
+                    error=str(exc),
+                )
+            )
+            continue
+
+        file_results.append(
+            FileProcessingResult(
+                file_path=file_path,
+                raw_page_count=pipeline_result.raw_page_count,
+                cleaned_page_count=pipeline_result.cleaned_page_count,
+                parent_chunk_count=len(pipeline_result.parent_chunks),
+                child_chunk_count=len(pipeline_result.child_chunks),
+                content_hash=pipeline_result.content_hash,
+                status=pipeline_result.status,
+                skip_reason=pipeline_result.skip_reason,
+            )
+        )
+
+    successful_files = sum(1 for file_result in file_results if file_result.status == "ok")
+    skipped_files = sum(1 for file_result in file_results if file_result.status == "skipped")
+    failed_files = sum(1 for file_result in file_results if file_result.status == "failed")
+    return BatchResult(
+        directory=path,
+        total_files=len(file_results),
+        successful_files=successful_files,
+        skipped_files=skipped_files,
+        failed_files=failed_files,
+        files=file_results,
+    )
+
+
+async def run_batch_pipeline_async(
+    directory: str | Path,
+    embeddings,
+    pipeline_config: PipelineConfig | None = None,
+    storage_backend=None,
+) -> BatchResult:
+    path = Path(directory)
+    supported_files = discover_supported_files(path)
+    pipeline_config = pipeline_config or PipelineConfig()
+    embeddings = _ensure_cached_embeddings(embeddings)
+    file_results: list[FileProcessingResult] = []
+
+    for file_path in supported_files:
+        try:
+            pipeline_result = await run_document_pipeline_async(
                 file_path,
                 PipelineConfig(chunking=pipeline_config.chunking),
                 embeddings,

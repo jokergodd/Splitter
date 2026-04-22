@@ -74,4 +74,31 @@ def fetch_parent_chunks(parent_ids: list[str], mongo_repository) -> list[Documen
     return ordered_chunks
 
 
-__all__ = ["collapse_to_parent_hits", "fetch_parent_chunks"]
+async def fetch_parent_chunks_async(parent_ids: list[str], mongo_repository) -> list[Document]:
+    if not parent_ids:
+        return []
+
+    collection = getattr(mongo_repository, "_async_parent_chunks", None)
+    if collection is None:
+        raise AttributeError("mongo_repository must expose _async_parent_chunks for async fetch")
+
+    unique_parent_ids = list(dict.fromkeys(str(parent_id) for parent_id in parent_ids))
+    cursor = collection.find({"parent_id": {"$in": unique_parent_ids}})
+    records = await cursor.to_list(length=None)
+
+    records_by_parent_id: dict[str, dict] = {}
+    for record in records:
+        parent_id = record.get("parent_id")
+        if parent_id is not None and str(parent_id) not in records_by_parent_id:
+            records_by_parent_id[str(parent_id)] = dict(record)
+
+    ordered_chunks: list[Document] = []
+    for parent_id in parent_ids:
+        record = records_by_parent_id.get(str(parent_id))
+        if record is not None:
+            ordered_chunks.append(_parent_chunk_document(record))
+
+    return ordered_chunks
+
+
+__all__ = ["collapse_to_parent_hits", "fetch_parent_chunks", "fetch_parent_chunks_async"]

@@ -18,25 +18,35 @@ class DeepSeekConfig:
 
 
 def load_deepseek_config() -> DeepSeekConfig:
-    load_dotenv(dotenv_path=Path.cwd() / ".env")
+    try:
+        from runtime.settings import load_settings
 
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    base_url = os.getenv("DEEPSEEK_BASE_URL")
-    model = os.getenv("DEEPSEEK_MODEL")
-
-    missing = [
-        name
-        for name, value in (
-            ("DEEPSEEK_API_KEY", api_key),
-            ("DEEPSEEK_BASE_URL", base_url),
-            ("DEEPSEEK_MODEL", model),
+        settings = load_settings()
+        return DeepSeekConfig(
+            api_key=settings.runtime.deepseek_api_key,
+            base_url=settings.runtime.deepseek_base_url,
+            model=settings.runtime.deepseek_model,
         )
-        if not value
-    ]
-    if missing:
-        raise ValueError(f"Missing required DeepSeek config: {', '.join(missing)}")
+    except Exception:
+        load_dotenv(dotenv_path=Path.cwd() / ".env")
 
-    return DeepSeekConfig(api_key=api_key, base_url=base_url, model=model)
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        base_url = os.getenv("DEEPSEEK_BASE_URL")
+        model = os.getenv("DEEPSEEK_MODEL")
+
+        missing = [
+            name
+            for name, value in (
+                ("DEEPSEEK_API_KEY", api_key),
+                ("DEEPSEEK_BASE_URL", base_url),
+                ("DEEPSEEK_MODEL", model),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(f"Missing required DeepSeek config: {', '.join(missing)}")
+
+        return DeepSeekConfig(api_key=api_key, base_url=base_url, model=model)
 
 
 def build_deepseek_llm(config: DeepSeekConfig) -> ChatDeepSeek:

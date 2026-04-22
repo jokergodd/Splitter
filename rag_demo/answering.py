@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from collections.abc import Sequence
 from typing import Any
 
 from langchain_core.documents import Document
 
-from .parent_recall import collapse_to_parent_hits, fetch_parent_chunks
-from .query_rewrite import rewrite_queries
+from .parent_recall import collapse_to_parent_hits, fetch_parent_chunks, fetch_parent_chunks_async
+from .query_rewrite import rewrite_queries, rewrite_queries_async
 from .rerank import rerank_candidates
-from .retrieval import HybridRetrievalHit, query_hybrid_children_for_queries
+from .retrieval import (
+    HybridRetrievalHit,
+    query_hybrid_children_for_queries,
+    query_hybrid_children_for_queries_async,
+)
 
 
 @dataclass(slots=True)
@@ -135,4 +140,58 @@ def answer_query(
     )
 
 
-__all__ = ["AnswerResult", "answer_query", "build_answer_prompt"]
+async def answer_query_async(
+    *,
+    original_query: str,
+    llm: Any,
+    client: Any,
+    collection_name: str,
+    embeddings: Any,
+    sparse_embeddings: Any,
+    mongo_repository: Any,
+    top_k: int = 10,
+    candidate_limit: int = 30,
+    max_queries: int = 4,
+    reranker: Any | None = None,
+    parent_limit: int = 5,
+) -> AnswerResult:
+    rewrite_result = await rewrite_queries_async(original_query, llm, max_queries=max_queries)
+    candidate_hits = await query_hybrid_children_for_queries_async(
+        client=client,
+        collection_name=collection_name,
+        query_texts=rewrite_result.rewritten_queries,
+        embeddings=embeddings,
+        sparse_embeddings=sparse_embeddings,
+        top_k=top_k,
+        candidate_limit=candidate_limit,
+    )
+
+    candidate_documents = [_child_hit_to_document(hit) for hit in candidate_hits]
+    reranked_documents = await asyncio.to_thread(
+        rerank_candidates,
+        original_query,
+        candidate_documents,
+        reranker,
+        candidate_limit,
+    )
+    parent_hit_documents = collapse_to_parent_hits(reranked_documents, limit=parent_limit)
+    parent_ids = [
+        str(parent_hit.metadata["parent_id"])
+        for parent_hit in parent_hit_documents
+        if parent_hit.metadata.get("parent_id") is not None
+    ]
+    parent_chunks = await fetch_parent_chunks_async(parent_ids, mongo_repository)
+    prompt = build_answer_prompt(original_query, parent_chunks)
+    if hasattr(llm, "ainvoke"):
+        llm_result = await llm.ainvoke(prompt)
+    else:
+        llm_result = await asyncio.to_thread(llm.invoke, prompt)
+    return AnswerResult(
+        answer=_message_to_text(llm_result),
+        rewritten_queries=list(rewrite_result.rewritten_queries),
+        parent_chunks=parent_chunks,
+        source_items=_source_items(parent_chunks),
+    )
+
+
+__all__ = ["AnswerResult", "answer_query", "answer_query_async", "build_answer_prompt"]

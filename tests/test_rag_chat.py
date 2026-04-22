@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -72,9 +73,19 @@ def test_main_runs_repl_and_prints_answer_and_sources_then_exits(monkeypatch, ca
             }
         ],
     )
+    captured_runtime: list[object] = []
+    calls: list[str] = []
+
+    class FakeChatService:
+        def __init__(self, runtime_arg):
+            captured_runtime.append(runtime_arg)
+
+        async def answer(self, *, question: str):
+            calls.append(question)
+            return result
 
     monkeypatch.setattr(rag_chat, "build_runtime", lambda: runtime)
-    monkeypatch.setattr(rag_chat, "_answer_question", lambda question, runtime: result)
+    monkeypatch.setattr(rag_chat, "ChatService", FakeChatService)
 
     prompts: list[str] = []
     inputs = iter(["hello", "quit"])
@@ -85,6 +96,8 @@ def test_main_runs_repl_and_prints_answer_and_sources_then_exits(monkeypatch, ca
 
     output = capsys.readouterr().out
     assert exit_code == 0
+    assert captured_runtime == [runtime]
+    assert calls == ["hello"]
     assert prompts == ["Question> ", "Question> "]
     assert "Answer:" in output
     assert "final answer" in output
@@ -109,14 +122,18 @@ def test_main_continues_after_answering_error(monkeypatch, capsys):
     )
     calls: list[str] = []
 
-    def fake_answer(question, runtime):
-        calls.append(question)
-        if question == "bad":
-            raise RuntimeError("boom")
-        return result
+    class FakeChatService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, *, question: str):
+            calls.append(question)
+            if question == "bad":
+                raise RuntimeError("boom")
+            return result
 
     monkeypatch.setattr(rag_chat, "build_runtime", lambda: runtime)
-    monkeypatch.setattr(rag_chat, "_answer_question", fake_answer)
+    monkeypatch.setattr(rag_chat, "ChatService", FakeChatService)
 
     inputs = iter(["bad", "good", "exit"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
@@ -129,3 +146,34 @@ def test_main_continues_after_answering_error(monkeypatch, capsys):
     assert "Error: boom" in output
     assert "recovered answer" in output
     assert "parent_id=parent-2" in output
+
+
+def test_main_uses_asyncio_run_with_chat_service(monkeypatch):
+    runtime = SimpleNamespace(llm=object(), dense_embeddings=object(), sparse_embeddings=object(), reranker=object(), storage_backend=object())
+    awaited: list[str] = []
+    seen_coroutines: list[object] = []
+    original_asyncio_run = asyncio.run
+
+    class FakeChatService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, *, question: str):
+            awaited.append(question)
+            return SimpleNamespace(answer="ok", source_items=[])
+
+    def fake_asyncio_run(coro):
+        seen_coroutines.append(coro)
+        return original_asyncio_run(coro)
+
+    monkeypatch.setattr(rag_chat, "build_runtime", lambda: runtime)
+    monkeypatch.setattr(rag_chat, "ChatService", FakeChatService)
+    monkeypatch.setattr(rag_chat.asyncio, "run", fake_asyncio_run)
+    inputs = iter(["hello", "quit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+    exit_code = rag_chat.main()
+
+    assert exit_code == 0
+    assert awaited == ["hello"]
+    assert len(seen_coroutines) == 1

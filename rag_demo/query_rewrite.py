@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -10,14 +11,16 @@ class QueryRewriteResult:
     rewritten_queries: list[str] = field(default_factory=list)
 
 
-def rewrite_queries(query: str, llm: Any, max_queries: int = 4) -> QueryRewriteResult:
-    limit = max(1, max_queries)
-    prompt = (
+def _rewrite_prompt(query: str) -> str:
+    return (
         "Rewrite the following query into short alternative search queries, "
         "one per line, without numbering or extra commentary:\n"
         f"{query}"
     )
-    raw_output = llm.invoke(prompt)
+
+
+def _rewrite_result(query: str, raw_output: Any, *, max_queries: int) -> QueryRewriteResult:
+    limit = max(1, max_queries)
 
     if isinstance(raw_output, str):
         candidates = raw_output.splitlines()
@@ -41,3 +44,17 @@ def rewrite_queries(query: str, llm: Any, max_queries: int = 4) -> QueryRewriteR
             break
 
     return QueryRewriteResult(original_query=query, rewritten_queries=rewritten_queries[:limit])
+
+
+def rewrite_queries(query: str, llm: Any, max_queries: int = 4) -> QueryRewriteResult:
+    raw_output = llm.invoke(_rewrite_prompt(query))
+    return _rewrite_result(query, raw_output, max_queries=max_queries)
+
+
+async def rewrite_queries_async(query: str, llm: Any, max_queries: int = 4) -> QueryRewriteResult:
+    prompt = _rewrite_prompt(query)
+    if hasattr(llm, "ainvoke"):
+        raw_output = await llm.ainvoke(prompt)
+    else:
+        raw_output = await asyncio.to_thread(llm.invoke, prompt)
+    return _rewrite_result(query, raw_output, max_queries=max_queries)

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
-from rag_demo.query_rewrite import QueryRewriteResult, rewrite_queries
+from rag_demo.query_rewrite import QueryRewriteResult, rewrite_queries, rewrite_queries_async
 
 
 class _FakeLLM:
@@ -11,6 +12,12 @@ class _FakeLLM:
         self.calls: list[str] = []
 
     def invoke(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        return "\n".join(self.responses)
+
+
+class _FakeAsyncLLM(_FakeLLM):
+    async def ainvoke(self, prompt: str) -> str:
         self.calls.append(prompt)
         return "\n".join(self.responses)
 
@@ -47,3 +54,12 @@ def test_rewrite_queries_accepts_message_like_llm_response():
     result = rewrite_queries("原始问题", llm, max_queries=4)
 
     assert result.rewritten_queries == ["原始问题", "候选一", "候选二"]
+
+
+def test_rewrite_queries_async_prefers_ainvoke():
+    llm = _FakeAsyncLLM(["候选一", "候选二"])
+
+    result = asyncio.run(rewrite_queries_async("原始问题", llm, max_queries=4))
+
+    assert result.rewritten_queries == ["原始问题", "候选一", "候选二"]
+    assert len(llm.calls) == 1

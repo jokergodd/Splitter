@@ -67,17 +67,11 @@ def test_main_prints_pipeline_summary_for_generic_file(monkeypatch, capsys, tmp_
     file_path = tmp_path / "demo.docx"
     file_path.write_bytes(b"docx")
 
-    captured = {}
+    captured = {"runtime": object()}
 
-    def fake_embeddings(model_name):
-        captured["model_name"] = model_name
-        return SimpleNamespace(model_name=model_name)
-
-    def fake_run_document_pipeline(input_file, config, embeddings, storage_backend=None):
-        captured["file_path"] = input_file
+    async def fake_ingest_file(*, file_path, config):
+        captured["file_path"] = file_path
         captured["config"] = config
-        captured["embeddings"] = embeddings
-        captured["storage_backend"] = storage_backend
         return SimpleNamespace(
             raw_page_count=3,
             cleaned_page_count=2,
@@ -90,15 +84,15 @@ def test_main_prints_pipeline_summary_for_generic_file(monkeypatch, capsys, tmp_
             skip_reason=None,
         )
 
-    monkeypatch.setattr(main, "HuggingFaceEmbeddings", fake_embeddings)
-    monkeypatch.setattr(main, "SparseTextEmbedding", lambda model_name: SimpleNamespace(model_name=model_name))
-    monkeypatch.setattr(
-        main,
-        "build_storage_backend",
-        lambda *, sparse_embeddings: captured.__setitem__("storage_sparse_embeddings", sparse_embeddings)
-        or "storage-backend",
-    )
-    monkeypatch.setattr(main, "run_document_pipeline", fake_run_document_pipeline)
+    class FakeIngestService:
+        def __init__(self, runtime):
+            captured["service_runtime"] = runtime
+
+        async def ingest_file(self, *, file_path, config):
+            return await fake_ingest_file(file_path=file_path, config=config)
+
+    monkeypatch.setattr(main, "get_ingest_runtime", lambda: captured["runtime"])
+    monkeypatch.setattr(main, "IngestService", FakeIngestService)
     monkeypatch.setattr(main.sys, "argv", ["main.py", "--file", str(file_path)])
 
     assert main.main() == 0
@@ -114,22 +108,15 @@ def test_main_prints_pipeline_summary_for_generic_file(monkeypatch, capsys, tmp_
     assert "Sample child metadata:" in output
     assert "child_id" in output
     assert "parent_id" in output
-    assert captured["model_name"] == "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     assert captured["file_path"] == file_path
     assert captured["config"] == PipelineConfig(chunking=ChunkingConfig())
-    assert isinstance(captured["embeddings"], CachedEmbeddings)
-    assert captured["embeddings"].base_embeddings.model_name == "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    assert captured["storage_sparse_embeddings"].model_name == "Qdrant/bm25"
-    assert captured["storage_backend"] == "storage-backend"
+    assert captured["service_runtime"] is captured["runtime"]
 
 
 def test_main_fails_fast_on_missing_file_before_embeddings(monkeypatch, tmp_path):
     file_path = tmp_path / "missing.docx"
 
-    def fail_if_called(model_name):
-        raise AssertionError(f"embeddings should not initialize for missing path: {model_name}")
-
-    monkeypatch.setattr(main, "HuggingFaceEmbeddings", fail_if_called)
+    monkeypatch.setattr(main, "get_ingest_runtime", lambda: (_ for _ in ()).throw(AssertionError("runtime should not initialize")))
     monkeypatch.setattr(main.sys, "argv", ["main.py", "--file", str(file_path)])
 
     with pytest.raises(FileNotFoundError) as excinfo:
@@ -146,16 +133,10 @@ def test_main_runs_batch_mode_for_data_directory(monkeypatch, capsys, tmp_path):
     first_file.write_bytes(b"%PDF-1.4\n")
     second_file.write_text("# hello", encoding="utf-8")
 
-    captured = {}
+    captured = {"runtime": object()}
 
-    def fake_embeddings(model_name):
-        captured["model_name"] = model_name
-        return SimpleNamespace(model_name=model_name)
-
-    def fake_run_batch_pipeline(directory, embeddings, storage_backend=None):
-        captured["directory"] = directory
-        captured["embeddings"] = embeddings
-        captured["storage_backend"] = storage_backend
+    async def fake_ingest_batch(*, data_dir):
+        captured["directory"] = data_dir
         return SimpleNamespace(
             total_files=2,
             successful_files=1,
@@ -187,15 +168,15 @@ def test_main_runs_batch_mode_for_data_directory(monkeypatch, capsys, tmp_path):
             ],
         )
 
-    monkeypatch.setattr(main, "HuggingFaceEmbeddings", fake_embeddings)
-    monkeypatch.setattr(main, "SparseTextEmbedding", lambda model_name: SimpleNamespace(model_name=model_name))
-    monkeypatch.setattr(
-        main,
-        "build_storage_backend",
-        lambda *, sparse_embeddings: captured.__setitem__("storage_sparse_embeddings", sparse_embeddings)
-        or "storage-backend",
-    )
-    monkeypatch.setattr(main, "run_batch_pipeline", fake_run_batch_pipeline)
+    class FakeIngestService:
+        def __init__(self, runtime):
+            captured["service_runtime"] = runtime
+
+        async def ingest_batch(self, *, data_dir):
+            return await fake_ingest_batch(data_dir=data_dir)
+
+    monkeypatch.setattr(main, "get_ingest_runtime", lambda: captured["runtime"])
+    monkeypatch.setattr(main, "IngestService", FakeIngestService)
     monkeypatch.setattr(main.sys, "argv", ["main.py", "--data-dir", str(data_dir)])
 
     assert main.main() == 0
@@ -206,27 +187,18 @@ def test_main_runs_batch_mode_for_data_directory(monkeypatch, capsys, tmp_path):
     assert "Failed: 1" in output
     assert f"{first_file.name} raw=3 cleaned=2 parent=1 child=2" in output
     assert f"{second_file.name} error=parse failed" in output
-    assert captured["model_name"] == "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     assert captured["directory"] == data_dir
-    assert isinstance(captured["embeddings"], CachedEmbeddings)
-    assert captured["embeddings"].base_embeddings.model_name == "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    assert captured["storage_sparse_embeddings"].model_name == "Qdrant/bm25"
-    assert captured["storage_backend"] == "storage-backend"
+    assert captured["service_runtime"] is captured["runtime"]
 
 
 def test_main_prints_empty_batch_summary_for_directory_without_supported_files(monkeypatch, capsys, tmp_path):
     data_dir = tmp_path / "batch"
     data_dir.mkdir()
 
-    captured = {}
+    captured = {"runtime": object()}
 
-    def fake_embeddings(model_name):
-        captured["model_name"] = model_name
-        return SimpleNamespace(model_name=model_name)
-
-    def fake_run_batch_pipeline(directory, embeddings, storage_backend=None):
-        captured["directory"] = directory
-        captured["embeddings"] = embeddings
+    async def fake_ingest_batch(*, data_dir):
+        captured["directory"] = data_dir
         return SimpleNamespace(
             total_files=0,
             successful_files=0,
@@ -235,15 +207,15 @@ def test_main_prints_empty_batch_summary_for_directory_without_supported_files(m
             files=[],
         )
 
-    monkeypatch.setattr(main, "HuggingFaceEmbeddings", fake_embeddings)
-    monkeypatch.setattr(main, "SparseTextEmbedding", lambda model_name: SimpleNamespace(model_name=model_name))
-    monkeypatch.setattr(
-        main,
-        "build_storage_backend",
-        lambda *, sparse_embeddings: captured.__setitem__("storage_sparse_embeddings", sparse_embeddings)
-        or "storage-backend",
-    )
-    monkeypatch.setattr(main, "run_batch_pipeline", fake_run_batch_pipeline)
+    class FakeIngestService:
+        def __init__(self, runtime):
+            captured["service_runtime"] = runtime
+
+        async def ingest_batch(self, *, data_dir):
+            return await fake_ingest_batch(data_dir=data_dir)
+
+    monkeypatch.setattr(main, "get_ingest_runtime", lambda: captured["runtime"])
+    monkeypatch.setattr(main, "IngestService", FakeIngestService)
     monkeypatch.setattr(main.sys, "argv", ["main.py", "--data-dir", str(data_dir)])
 
     assert main.main() == 0
@@ -253,6 +225,7 @@ def test_main_prints_empty_batch_summary_for_directory_without_supported_files(m
     assert "Successful: 0" in output
     assert "Failed: 0" in output
     assert captured["directory"] == data_dir
+    assert captured["service_runtime"] is captured["runtime"]
 
 
 def test_main_prints_skipped_summary(monkeypatch, capsys, tmp_path):
@@ -261,10 +234,7 @@ def test_main_prints_skipped_summary(monkeypatch, capsys, tmp_path):
     skipped_file = data_dir / "dup.txt"
     skipped_file.write_text("same", encoding="utf-8")
 
-    def fake_embeddings(model_name):
-        return SimpleNamespace(model_name=model_name)
-
-    def fake_run_batch_pipeline(directory, embeddings, storage_backend=None):
+    async def fake_ingest_batch(*, data_dir):
         return SimpleNamespace(
             total_files=1,
             successful_files=0,
@@ -285,10 +255,15 @@ def test_main_prints_skipped_summary(monkeypatch, capsys, tmp_path):
             ],
         )
 
-    monkeypatch.setattr(main, "HuggingFaceEmbeddings", fake_embeddings)
-    monkeypatch.setattr(main, "SparseTextEmbedding", lambda model_name: SimpleNamespace(model_name=model_name))
-    monkeypatch.setattr(main, "build_storage_backend", lambda *, sparse_embeddings: "storage-backend")
-    monkeypatch.setattr(main, "run_batch_pipeline", fake_run_batch_pipeline)
+    class FakeIngestService:
+        def __init__(self, runtime):
+            self.runtime = runtime
+
+        async def ingest_batch(self, *, data_dir):
+            return await fake_ingest_batch(data_dir=data_dir)
+
+    monkeypatch.setattr(main, "get_ingest_runtime", lambda: object())
+    monkeypatch.setattr(main, "IngestService", FakeIngestService)
     monkeypatch.setattr(main.sys, "argv", ["main.py", "--data-dir", str(data_dir)])
 
     assert main.main() == 0
@@ -301,10 +276,7 @@ def test_main_prints_skipped_summary(monkeypatch, capsys, tmp_path):
 def test_main_fails_fast_on_missing_data_directory_before_embeddings(monkeypatch, tmp_path):
     data_dir = tmp_path / "missing-batch"
 
-    def fail_if_called(model_name):
-        raise AssertionError(f"embeddings should not initialize for missing directory: {model_name}")
-
-    monkeypatch.setattr(main, "HuggingFaceEmbeddings", fail_if_called)
+    monkeypatch.setattr(main, "get_ingest_runtime", lambda: (_ for _ in ()).throw(AssertionError("runtime should not initialize")))
     monkeypatch.setattr(main.sys, "argv", ["main.py", "--data-dir", str(data_dir)])
 
     with pytest.raises(FileNotFoundError) as excinfo:

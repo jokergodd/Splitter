@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
@@ -78,6 +79,39 @@ def query_hybrid_children(
     return [_extract_hybrid_hit(point) for point in getattr(response, "points", response)]
 
 
+async def query_hybrid_children_async(
+    *,
+    client,
+    collection_name: str,
+    query_text: str,
+    embeddings,
+    sparse_embeddings,
+    top_k: int = 10,
+    candidate_limit: int | None = None,
+    dense_vector_name: str = "dense",
+    sparse_vector_name: str = "sparse",
+    with_payload: bool = True,
+) -> list[HybridRetrievalHit]:
+    dense_vector, sparse_vector = await asyncio.gather(
+        asyncio.to_thread(embeddings.embed_query, query_text),
+        asyncio.to_thread(_embed_sparse_query, sparse_embeddings, query_text),
+    )
+    prefetch_limit = candidate_limit or top_k
+
+    response = await client.query_points(
+        collection_name=collection_name,
+        query=FusionQuery(fusion=Fusion.RRF),
+        prefetch=[
+            Prefetch(query=dense_vector, using=dense_vector_name, limit=prefetch_limit),
+            Prefetch(query=sparse_vector, using=sparse_vector_name, limit=prefetch_limit),
+        ],
+        limit=top_k,
+        with_payload=with_payload,
+    )
+
+    return [_extract_hybrid_hit(point) for point in getattr(response, "points", response)]
+
+
 def merge_hybrid_hits(
     *hit_groups: Sequence[HybridRetrievalHit],
     candidate_limit: int,
@@ -133,9 +167,43 @@ def query_hybrid_children_for_queries(
     return merge_hybrid_hits(*hit_groups, candidate_limit=candidate_limit)
 
 
+async def query_hybrid_children_for_queries_async(
+    *,
+    client,
+    collection_name: str,
+    query_texts: Iterable[str],
+    embeddings,
+    sparse_embeddings,
+    top_k: int = 10,
+    candidate_limit: int = 30,
+    dense_vector_name: str = "dense",
+    sparse_vector_name: str = "sparse",
+    single_query_fn: Callable[..., Any] | None = None,
+) -> list[HybridRetrievalHit]:
+    single_query_fn = single_query_fn or query_hybrid_children_async
+    coroutines = [
+        single_query_fn(
+            client=client,
+            collection_name=collection_name,
+            query_text=query_text,
+            embeddings=embeddings,
+            sparse_embeddings=sparse_embeddings,
+            top_k=top_k,
+            candidate_limit=candidate_limit,
+            dense_vector_name=dense_vector_name,
+            sparse_vector_name=sparse_vector_name,
+        )
+        for query_text in query_texts
+    ]
+    hit_groups = await asyncio.gather(*coroutines)
+    return merge_hybrid_hits(*hit_groups, candidate_limit=candidate_limit)
+
+
 __all__ = [
     "HybridRetrievalHit",
     "merge_hybrid_hits",
     "query_hybrid_children",
+    "query_hybrid_children_async",
     "query_hybrid_children_for_queries",
+    "query_hybrid_children_for_queries_async",
 ]
