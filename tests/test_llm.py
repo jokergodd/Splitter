@@ -7,7 +7,10 @@ import pytest
 
 from rag_demo.llm import (
     DeepSeekConfig,
+    build_deepseek_async_openai_client,
+    build_deepseek_openai_client,
     build_deepseek_llm,
+    build_ragas_eval_llm,
     load_deepseek_config,
 )
 
@@ -117,4 +120,81 @@ def test_build_deepseek_llm_passes_config_through_to_chatdeepseek(monkeypatch):
         "api_key": "test-key",
         "base_url": "https://api.example.com",
         "model": "deepseek-chat",
+    }
+
+
+def test_build_deepseek_openai_client_passes_config_through(monkeypatch):
+    captured: dict[str, str] = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("rag_demo.llm.OpenAI", FakeOpenAI)
+
+    client = build_deepseek_openai_client(
+        DeepSeekConfig(
+            api_key="test-key",
+            base_url="https://api.example.com",
+            model="deepseek-chat",
+        )
+    )
+
+    assert isinstance(client, FakeOpenAI)
+    assert captured == {
+        "api_key": "test-key",
+        "base_url": "https://api.example.com",
+    }
+
+
+def test_build_ragas_eval_llm_uses_openai_compatible_client_and_model(monkeypatch):
+    fake_client = object()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "rag_demo.llm.build_deepseek_async_openai_client",
+        lambda config: fake_client,
+    )
+    monkeypatch.setattr(
+        "rag_demo.llm.llm_factory",
+        lambda model, *, client: captured.update({"model": model, "client": client})
+        or "ragas-llm",
+    )
+
+    llm = build_ragas_eval_llm(
+        DeepSeekConfig(
+            api_key="test-key",
+            base_url="https://api.example.com",
+            model="deepseek-chat",
+        )
+    )
+
+    assert llm == "ragas-llm"
+    assert captured == {
+        "model": "deepseek-chat",
+        "client": fake_client,
+    }
+
+
+def test_build_deepseek_async_openai_client_passes_config_through(monkeypatch):
+    captured: dict[str, str] = {}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("rag_demo.llm.AsyncOpenAI", FakeAsyncOpenAI)
+
+    client = build_deepseek_async_openai_client(
+        DeepSeekConfig(
+            api_key="test-key",
+            base_url="https://api.example.com",
+            model="deepseek-chat",
+        )
+    )
+
+    assert isinstance(client, FakeAsyncOpenAI)
+    assert captured == {
+        "api_key": "test-key",
+        "base_url": "https://api.example.com",
     }

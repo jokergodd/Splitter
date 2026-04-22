@@ -19,6 +19,8 @@ DEFAULT_SPARSE_MODEL_NAME = "Qdrant/bm25"
 class Runtime:
     llm: object
     dense_embeddings: object
+    eval_llm: object | None
+    eval_embeddings: object | None
     sparse_embeddings: object
     reranker: object
     storage_backend: object
@@ -36,6 +38,8 @@ def build_runtime() -> Runtime:
     return Runtime(
         llm=llm,
         dense_embeddings=dense_embeddings,
+        eval_llm=None,
+        eval_embeddings=None,
         sparse_embeddings=sparse_embeddings,
         reranker=reranker,
         storage_backend=storage_backend,

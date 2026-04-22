@@ -46,6 +46,8 @@ def test_build_runtime_initializes_all_runtime_dependencies_once(monkeypatch):
     assert runtime.llm is fake_llm
     assert isinstance(runtime.dense_embeddings, FakeCachedEmbeddings)
     assert runtime.dense_embeddings.base_embeddings.__class__ is FakeDenseEmbeddings
+    assert runtime.eval_llm is None
+    assert runtime.eval_embeddings is None
     assert isinstance(runtime.sparse_embeddings, FakeSparseEmbeddings)
     assert runtime.reranker is fake_reranker
     assert runtime.storage_backend is fake_storage_backend

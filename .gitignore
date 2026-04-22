@@ -12,3 +12,6 @@ wheels/
 .pytest_cache
 data/
 docs/
+artifacts/
+.claude/
+CLAUDE.md

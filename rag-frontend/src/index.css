@@ -1,0 +1,12 @@
+/* RAG 知识库助手 - 全局基础样式 */
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #f5f5f5;
+}
