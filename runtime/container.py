@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable
@@ -23,6 +24,31 @@ class Runtime:
     sparse_embeddings: Any
     reranker: Any
     storage_backend: Any
+
+
+async def close_runtime(runtime: Runtime | None) -> None:
+    if runtime is None:
+        return
+
+    storage_backend = getattr(runtime, "storage_backend", None)
+    mongo_repository = getattr(storage_backend, "mongo_repository", None)
+    qdrant_store = getattr(storage_backend, "qdrant_store", None)
+
+    async_mongo_client = getattr(mongo_repository, "async_client", None)
+    if async_mongo_client is not None:
+        await async_mongo_client.close()
+
+    async_qdrant_client = getattr(qdrant_store, "async_client", None)
+    if async_qdrant_client is not None:
+        await async_qdrant_client.close()
+
+    qdrant_client = getattr(qdrant_store, "client", None)
+    if qdrant_client is not None and hasattr(qdrant_client, "close"):
+        close = qdrant_client.close
+        if asyncio.iscoroutinefunction(close):
+            await close()
+        else:
+            await asyncio.to_thread(close)
 
 
 def _build_embeddings_and_storage(
@@ -140,3 +166,8 @@ def get_runtime() -> Runtime:
 @lru_cache(maxsize=1)
 def get_ingest_runtime() -> Runtime:
     return build_ingest_runtime(settings=get_settings())
+
+
+def clear_runtime_caches() -> None:
+    get_runtime.cache_clear()
+    get_ingest_runtime.cache_clear()

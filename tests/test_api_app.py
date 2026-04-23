@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
 from api.app import create_app
 from runtime.settings import AppSettings, RuntimeSettings, Settings
 
@@ -19,3 +21,21 @@ def test_create_app_uses_settings_title_and_version():
     assert app.title == "Custom Splitter"
     assert app.version == "9.9.9"
     assert app.state.settings is settings
+
+
+def test_create_app_lifespan_initializes_shared_services():
+    settings = Settings(
+        app=AppSettings(app_name="Custom Splitter", app_version="9.9.9"),
+        runtime=RuntimeSettings(
+            deepseek_api_key="key",
+            deepseek_base_url="https://api.example.com",
+            deepseek_model="deepseek-chat",
+        ),
+    )
+
+    app = create_app(settings=settings)
+
+    with TestClient(app):
+        assert hasattr(app.state, "runtime")
+        assert hasattr(app.state, "ingest_runtime")
+        assert hasattr(app.state, "task_service")

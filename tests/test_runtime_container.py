@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import runtime.container as runtime_container
@@ -108,3 +109,36 @@ def test_build_ingest_runtime_initializes_only_ingest_dependencies(monkeypatch):
         "sparse_model_name": runtime_container.DEFAULT_SPARSE_MODEL_NAME,
         "storage_sparse_embeddings": runtime.sparse_embeddings,
     }
+
+
+def test_close_runtime_closes_async_clients_and_sync_qdrant_client():
+    events: list[str] = []
+
+    class FakeAsyncMongoClient:
+        async def close(self):
+            events.append("async_mongo")
+
+    class FakeAsyncQdrantClient:
+        async def close(self):
+            events.append("async_qdrant")
+
+    class FakeQdrantClient:
+        def close(self):
+            events.append("sync_qdrant")
+
+    runtime = runtime_container.Runtime(
+        llm=None,
+        dense_embeddings=None,
+        eval_llm=None,
+        eval_embeddings=None,
+        sparse_embeddings=None,
+        reranker=None,
+        storage_backend=SimpleNamespace(
+            mongo_repository=SimpleNamespace(async_client=FakeAsyncMongoClient()),
+            qdrant_store=SimpleNamespace(client=FakeQdrantClient(), async_client=FakeAsyncQdrantClient()),
+        ),
+    )
+
+    asyncio.run(runtime_container.close_runtime(runtime))
+
+    assert events == ["async_mongo", "async_qdrant", "sync_qdrant"]

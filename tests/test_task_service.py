@@ -124,3 +124,12 @@ def test_get_task_raises_task_not_found_for_missing_task():
         assert exc.task_id == "missing"
     else:
         raise AssertionError("expected TaskNotFoundError")
+
+
+def test_task_service_close_shuts_down_owned_executor():
+    service = TaskService(SimpleNamespace())
+
+    executor = service._executor
+    service.close()
+
+    assert getattr(executor, "_shutdown", False) is True

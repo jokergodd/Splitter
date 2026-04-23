@@ -4,6 +4,8 @@ from functools import lru_cache
 from importlib import import_module
 from typing import Any
 
+from fastapi import Request
+
 from runtime.settings import get_settings as load_settings
 
 runtime_container: Any = None
@@ -53,21 +55,63 @@ def _instantiate_service(service_cls: Any, runtime: Any) -> Any:
     raise RuntimeError(f"Unable to instantiate {service_cls!r}")
 
 
-def get_chat_service(runtime: Any = None) -> Any:
+def get_chat_service(request: Request, runtime: Any = None) -> Any:
     service_cls = _load_service("services.chat_service", "ChatService", ChatService)
-    return _instantiate_service(service_cls, runtime or get_runtime())
+    active_runtime = runtime
+    if active_runtime is None and request is not None and hasattr(request.app.state, "runtime"):
+        active_runtime = request.app.state.runtime
+        if active_runtime is None:
+            active_runtime = get_runtime()
+            request.app.state.runtime = active_runtime
+    return _instantiate_service(service_cls, active_runtime or get_runtime())
 
 
-def get_ingest_service(runtime: Any = None) -> Any:
+def get_ingest_runtime(request: Request) -> Any:
+    container = _load_runtime_container()
+    if request is not None and hasattr(request.app.state, "ingest_runtime"):
+        active_runtime = request.app.state.ingest_runtime
+        if active_runtime is None:
+            active_runtime = container.get_ingest_runtime()
+            request.app.state.ingest_runtime = active_runtime
+        return active_runtime
+    return container.get_ingest_runtime()
+
+
+def get_ingest_service(request: Request, runtime: Any = None) -> Any:
     service_cls = _load_service("services.ingest_service", "IngestService", IngestService)
-    return _instantiate_service(service_cls, runtime or get_runtime())
+    active_runtime = runtime or get_ingest_runtime(request)
+    return _instantiate_service(service_cls, active_runtime)
 
 
-def get_task_service(runtime: Any = None) -> Any:
+@lru_cache(maxsize=1)
+def _get_default_task_service() -> Any:
     service_cls = _load_service("services.task_service", "TaskService", TaskService)
-    active_runtime = runtime or get_runtime()
     settings = get_settings()
+    active_runtime = _load_runtime_container().get_ingest_runtime()
     try:
         return service_cls(runtime=active_runtime, max_workers=settings.app.task_max_workers)
     except TypeError:
         return _instantiate_service(service_cls, active_runtime)
+
+
+def get_task_service(request: Request, runtime: Any = None) -> Any:
+    if request is not None and hasattr(request.app.state, "task_service"):
+        task_service = request.app.state.task_service
+        if task_service is None:
+            service_cls = _load_service("services.task_service", "TaskService", TaskService)
+            settings = get_settings()
+            active_runtime = runtime or get_ingest_runtime(request)
+            try:
+                task_service = service_cls(runtime=active_runtime, max_workers=settings.app.task_max_workers)
+            except TypeError:
+                task_service = _instantiate_service(service_cls, active_runtime)
+            request.app.state.task_service = task_service
+        return task_service
+    if runtime is not None:
+        service_cls = _load_service("services.task_service", "TaskService", TaskService)
+        settings = get_settings()
+        try:
+            return service_cls(runtime=runtime, max_workers=settings.app.task_max_workers)
+        except TypeError:
+            return _instantiate_service(service_cls, runtime)
+    return _get_default_task_service()
