@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,8 @@ def _coerce_mapping(value: Any) -> dict[str, Any]:
         return dict(value)
     if isinstance(value, BaseModel):
         return value.model_dump()
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: getattr(value, field.name) for field in fields(value)}
     if isinstance(value, str):
         return {"answer": value}
     if hasattr(value, "__dict__"):

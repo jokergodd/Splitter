@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from functools import lru_cache
 from importlib import import_module
 from typing import Any
@@ -43,27 +44,71 @@ def _load_service(module_name: str, class_name: str, fallback: Any) -> Any:
 
 
 def _instantiate_service(service_cls: Any, runtime: Any) -> Any:
-    for factory in (
-        lambda: service_cls(runtime=runtime),
-        lambda: service_cls(runtime),
-        lambda: service_cls(),
+    signature = inspect.signature(service_cls)
+    for args, kwargs in (
+        ((), {"runtime": runtime}),
+        ((runtime,), {}),
+        ((), {}),
     ):
         try:
-            return factory()
+            signature.bind(*args, **kwargs)
         except TypeError:
             continue
+        return service_cls(*args, **kwargs)
+    raise RuntimeError(f"Unable to instantiate {service_cls!r}")
+
+
+def _instantiate_chat_service(
+    service_cls: Any,
+    *,
+    runtime: Any | None = None,
+    runtime_factory: Any | None = None,
+) -> Any:
+    signature = inspect.signature(service_cls)
+    candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    if runtime is not None:
+        candidates.extend(
+            [
+                ((), {"runtime": runtime}),
+                ((runtime,), {}),
+            ]
+        )
+    if runtime_factory is not None:
+        candidates.append(((), {"runtime_factory": runtime_factory}))
+    candidates.append(((), {}))
+
+    for call_args, call_kwargs in candidates:
+        try:
+            signature.bind(*call_args, **call_kwargs)
+        except TypeError:
+            continue
+        return service_cls(*call_args, **call_kwargs)
     raise RuntimeError(f"Unable to instantiate {service_cls!r}")
 
 
 def get_chat_service(request: Request, runtime: Any = None) -> Any:
     service_cls = _load_service("services.chat_service", "ChatService", ChatService)
-    active_runtime = runtime
-    if active_runtime is None and request is not None and hasattr(request.app.state, "runtime"):
-        active_runtime = request.app.state.runtime
-        if active_runtime is None:
-            active_runtime = get_runtime()
-            request.app.state.runtime = active_runtime
-    return _instantiate_service(service_cls, active_runtime or get_runtime())
+    if request is not None and hasattr(request.app.state, "runtime"):
+        cached_service = getattr(request.app.state, "chat_service", None)
+        active_runtime = runtime if runtime is not None else request.app.state.runtime
+        if cached_service is not None and (active_runtime is None or getattr(cached_service, "runtime", None) is active_runtime):
+            return cached_service
+
+        def resolve_runtime() -> Any:
+            current_runtime = request.app.state.runtime
+            if current_runtime is None:
+                current_runtime = runtime if runtime is not None else get_runtime()
+                request.app.state.runtime = current_runtime
+            return current_runtime
+
+        service = _instantiate_chat_service(
+            service_cls,
+            runtime=active_runtime,
+            runtime_factory=None if active_runtime is not None else resolve_runtime,
+        )
+        request.app.state.chat_service = service
+        return service
+    return _instantiate_chat_service(service_cls, runtime=runtime or get_runtime())
 
 
 def get_ingest_runtime(request: Request) -> Any:

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pymongo.errors import ServerSelectionTimeoutError
 from qdrant_client.common.client_exceptions import QdrantException
+from qdrant_client.http.exceptions import UnexpectedResponse
 from fastapi.testclient import TestClient
 
 from api.app import app
+import api.dependencies as api_dependencies
 from api.dependencies import get_chat_service, get_ingest_service, get_runtime
 from services.exceptions import (
     CollectionNotReadyError,
@@ -216,6 +218,58 @@ def test_collection_not_ready_is_mapped_to_service_unavailable():
     }
 
 
+def test_chat_query_real_dependency_chain_keeps_collection_not_ready_semantics(monkeypatch):
+    class FakeGraph:
+        async def ainvoke(self, payload: dict):
+            raise UnexpectedResponse(
+                status_code=404,
+                reason_phrase="Not Found",
+                content=b"{\"status\":{\"error\":\"Not found: Collection `child_chunks_hybrid` doesn't exist!\"}}",
+                headers={},
+            )
+
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "llm": object(),
+            "dense_embeddings": object(),
+            "sparse_embeddings": object(),
+            "reranker": object(),
+            "storage_backend": type(
+                "StorageStub",
+                (),
+                {
+                    "qdrant_store": type(
+                        "QdrantStub",
+                        (),
+                        {"async_client": object(), "collection_name": "child_chunks_hybrid"},
+                    )(),
+                    "mongo_repository": object(),
+                },
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr(api_dependencies, "get_runtime", lambda: runtime)
+    monkeypatch.setattr("services.chat_graph_service.build_chat_graph", lambda deps: FakeGraph())
+    app.state.runtime = None
+    app.state.chat_service = None
+    client = TestClient(app)
+
+    response = client.post("/v1/chat/query", json={"question": "hello"})
+
+    app.state.runtime = None
+    app.state.chat_service = None
+
+    assert response.status_code == 503
+    assert _json_error(response) == {
+        "code": "COLLECTION_NOT_READY",
+        "message": "Collection 'child_chunks_hybrid' is not ready",
+        "details": {},
+    }
+
+
 def test_no_context_retrieved_is_mapped_to_not_found():
     class FakeChatService:
         async def answer(self, *, question: str):
@@ -227,6 +281,60 @@ def test_no_context_retrieved_is_mapped_to_not_found():
     response = client.post("/v1/chat/query", json={"question": "hello"})
 
     app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert _json_error(response) == {
+        "code": "NO_CONTEXT_RETRIEVED",
+        "message": "No relevant context was retrieved",
+        "details": {},
+    }
+
+
+def test_chat_query_real_dependency_chain_keeps_no_context_semantics(monkeypatch):
+    class FakeGraph:
+        async def ainvoke(self, payload: dict):
+            return {
+                "rewritten_queries": ["hello"],
+                "parent_chunks": [],
+                "response_payload": {
+                    "answer": "graph:hello",
+                    "source_items": [],
+                },
+            }
+
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "llm": object(),
+            "dense_embeddings": object(),
+            "sparse_embeddings": object(),
+            "reranker": object(),
+            "storage_backend": type(
+                "StorageStub",
+                (),
+                {
+                    "qdrant_store": type(
+                        "QdrantStub",
+                        (),
+                        {"async_client": object(), "collection_name": "child_chunks_hybrid"},
+                    )(),
+                    "mongo_repository": object(),
+                },
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr(api_dependencies, "get_runtime", lambda: runtime)
+    monkeypatch.setattr("services.chat_graph_service.build_chat_graph", lambda deps: FakeGraph())
+    app.state.runtime = None
+    app.state.chat_service = None
+    client = TestClient(app)
+
+    response = client.post("/v1/chat/query", json={"question": "hello"})
+
+    app.state.runtime = None
+    app.state.chat_service = None
 
     assert response.status_code == 404
     assert _json_error(response) == {

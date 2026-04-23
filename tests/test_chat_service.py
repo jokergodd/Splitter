@@ -1,174 +1,350 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
-from rag_demo.answering import AnswerResult
 from langchain_core.documents import Document
+from pymongo import errors as pymongo_errors
+from qdrant_client.common.client_exceptions import QdrantException
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+from rag_demo.answering import AnswerResult
 from services import chat_service
-from services.errors import CollectionNotReadyError, NoContextRetrievedError
+from services.errors import CollectionNotReadyError, DependencyUnavailableError, NoContextRetrievedError
 
 
-def test_answer_uses_async_answering_and_forwards_runtime_dependencies(monkeypatch):
-    runtime = SimpleNamespace(
-        llm=object(),
-        dense_embeddings=object(),
-        sparse_embeddings=object(),
-        reranker=object(),
-        storage_backend=SimpleNamespace(
-            qdrant_store=SimpleNamespace(async_client="async-client", collection_name="collection"),
-            mongo_repository="mongo",
-        ),
-    )
-    expected = AnswerResult(
-        answer="done",
-        parent_chunks=[Document(page_content="context", metadata={"parent_id": "parent-1"})],
-        source_items=[{"parent_id": "parent-1", "source": "doc.md", "file_path": "/tmp/doc.md"}],
-    )
+def test_chat_service_delegates_to_chat_graph_service(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    async def fake_answer_query_async(**kwargs):
-        captured["kwargs"] = kwargs
-        return expected
+    class FakeChatGraphService:
+        def __init__(self, runtime):
+            captured["runtime"] = runtime
 
-    monkeypatch.setattr(chat_service, "answer_query_async", fake_answer_query_async)
+        async def answer(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return AnswerResult(
+                answer="delegated",
+                parent_chunks=[
+                    Document(
+                        page_content="context",
+                        metadata={"parent_id": "p1", "source": "doc.md", "file_path": "/tmp/doc.md"},
+                    )
+                ],
+                source_items=[{"parent_id": "p1", "source": "doc.md", "file_path": "/tmp/doc.md"}],
+            )
 
-    async def run() -> AnswerResult:
-        return await chat_service.answer("hello", runtime, top_k=3, candidate_limit=7)
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
 
-    result = asyncio.run(run())
+    service = chat_service.ChatService(SimpleNamespace())
+    result = asyncio.run(service.answer(question="hello", top_k=2))
 
-    assert result is expected
-    assert captured["kwargs"]["original_query"] == "hello"
-    assert captured["kwargs"]["llm"] is runtime.llm
-    assert captured["kwargs"]["client"] == "async-client"
-    assert captured["kwargs"]["collection_name"] == "collection"
-    assert captured["kwargs"]["embeddings"] is runtime.dense_embeddings
-    assert captured["kwargs"]["sparse_embeddings"] is runtime.sparse_embeddings
-    assert captured["kwargs"]["mongo_repository"] == "mongo"
-    assert captured["kwargs"]["reranker"] is runtime.reranker
-    assert captured["kwargs"]["top_k"] == 3
-    assert captured["kwargs"]["candidate_limit"] == 7
-
-
-def test_answer_propagates_sync_errors(monkeypatch):
-    runtime = SimpleNamespace(
-        llm=object(),
-        dense_embeddings=object(),
-        sparse_embeddings=object(),
-        reranker=object(),
-        storage_backend=SimpleNamespace(
-            qdrant_store=SimpleNamespace(async_client="async-client", collection_name="collection"),
-            mongo_repository="mongo",
-        ),
+    assert result == AnswerResult(
+        answer="delegated",
+        parent_chunks=[
+            Document(
+                page_content="context",
+                metadata={"parent_id": "p1", "source": "doc.md", "file_path": "/tmp/doc.md"},
+            )
+        ],
+        source_items=[{"parent_id": "p1", "source": "doc.md", "file_path": "/tmp/doc.md"}],
     )
-
-    async def fake_answer_query_async(**kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(chat_service, "answer_query_async", fake_answer_query_async)
-
-    async def run() -> None:
-        await chat_service.answer("hello", runtime)
-
-    try:
-        asyncio.run(run())
-    except RuntimeError as exc:
-        assert str(exc) == "boom"
-    else:
-        raise AssertionError("expected RuntimeError")
-
-
-def test_answer_wraps_missing_collection_as_collection_not_ready(monkeypatch):
-    runtime = SimpleNamespace(
-        llm=object(),
-        dense_embeddings=object(),
-        sparse_embeddings=object(),
-        reranker=object(),
-        storage_backend=SimpleNamespace(
-            qdrant_store=SimpleNamespace(async_client="async-client", collection_name="child_chunks_hybrid"),
-            mongo_repository="mongo",
-        ),
-    )
-
-    async def fake_answer_query_async(**kwargs):
-        raise UnexpectedResponse(
-            status_code=404,
-            reason_phrase="Not Found",
-            content=b"{\"status\":{\"error\":\"Not found: Collection `child_chunks_hybrid` doesn't exist!\"}}",
-            headers={},
-        )
-
-    monkeypatch.setattr(chat_service, "answer_query_async", fake_answer_query_async)
-
-    async def run() -> None:
-        await chat_service.answer("hello", runtime)
-
-    try:
-        asyncio.run(run())
-    except CollectionNotReadyError as exc:
-        assert exc.collection_name == "child_chunks_hybrid"
-    else:
-        raise AssertionError("expected CollectionNotReadyError")
-
-
-def test_answer_raises_no_context_retrieved_when_parent_chunks_are_empty(monkeypatch):
-    runtime = SimpleNamespace(
-        llm=object(),
-        dense_embeddings=object(),
-        sparse_embeddings=object(),
-        reranker=object(),
-        storage_backend=SimpleNamespace(
-            qdrant_store=SimpleNamespace(async_client="async-client", collection_name="collection"),
-            mongo_repository="mongo",
-        ),
-    )
-
-    async def fake_answer_query_async(**kwargs):
-        return AnswerResult(answer="done", parent_chunks=[], source_items=[])
-
-    monkeypatch.setattr(chat_service, "answer_query_async", fake_answer_query_async)
-
-    async def run() -> None:
-        await chat_service.answer("hello", runtime)
-
-    try:
-        asyncio.run(run())
-    except NoContextRetrievedError as exc:
-        assert exc.question == "hello"
-    else:
-        raise AssertionError("expected NoContextRetrievedError")
-
-
-def test_chat_service_class_delegates_to_module_answer(monkeypatch):
-    runtime = SimpleNamespace()
-    expected = AnswerResult(answer="delegated")
-    captured: dict[str, object] = {}
-
-    async def fake_answer(question, runtime_arg, **kwargs):
-        captured["question"] = question
-        captured["runtime"] = runtime_arg
-        captured["kwargs"] = kwargs
-        return expected
-
-    monkeypatch.setattr(chat_service, "answer", fake_answer)
-
-    async def run() -> AnswerResult:
-        service = chat_service.ChatService(runtime)
-        return await service.answer(question="hello", top_k=2)
-
-    result = asyncio.run(run())
-
-    assert result is expected
     assert captured == {
-        "question": "hello",
-        "runtime": runtime,
+        "runtime": service.runtime,
         "kwargs": {
+            "question": "hello",
             "top_k": 2,
             "candidate_limit": 30,
             "max_queries": 4,
             "parent_limit": 5,
         },
     }
+
+
+def test_chat_service_raises_no_context_retrieved_for_empty_source_items(monkeypatch, caplog) -> None:
+    class FakeChatGraphService:
+        def __init__(self, runtime):
+            self.runtime = runtime
+
+        async def answer(self, **kwargs):
+            return {"answer": "delegated", "source_items": []}
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    service = chat_service.ChatService(SimpleNamespace())
+
+    with caplog.at_level(logging.INFO):
+        try:
+            asyncio.run(service.answer(question="hello"))
+        except NoContextRetrievedError as exc:
+            assert exc.question == "hello"
+        else:
+            raise AssertionError("expected NoContextRetrievedError")
+
+    events = [record.event for record in caplog.records if getattr(record, "event", None) and record.name == chat_service.__name__]
+    assert "chat.answer.started" in events
+    assert "chat.answer.failed" in events
+    failed = next(record for record in caplog.records if getattr(record, "event", None) == "chat.answer.failed")
+    assert failed.question == "hello"
+    assert failed.error == "No relevant context was retrieved"
+
+
+def test_module_answer_delegates_to_chat_graph_service(monkeypatch) -> None:
+    runtime = SimpleNamespace()
+    captured: dict[str, object] = {}
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            captured["runtime"] = runtime_arg
+
+        async def answer(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return {
+                "answer": "module-delegated",
+                "source_items": [{"parent_id": "p1", "source": "doc.md", "file_path": "/tmp/doc.md"}],
+            }
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    result = asyncio.run(chat_service.answer("hello", runtime, candidate_limit=7))
+
+    assert result == {
+        "answer": "module-delegated",
+        "source_items": [{"parent_id": "p1", "source": "doc.md", "file_path": "/tmp/doc.md"}],
+    }
+    assert captured == {
+        "runtime": runtime,
+        "kwargs": {
+            "question": "hello",
+            "top_k": 10,
+            "candidate_limit": 7,
+            "max_queries": 4,
+            "parent_limit": 5,
+        },
+    }
+
+
+def test_module_answer_wraps_missing_collection_as_collection_not_ready(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="child_chunks_hybrid"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise UnexpectedResponse(
+                status_code=404,
+                reason_phrase="Not Found",
+                content=b"{\"status\":{\"error\":\"Not found: Collection `child_chunks_hybrid` doesn't exist!\"}}",
+                headers={},
+            )
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.answer("hello", runtime))
+    except CollectionNotReadyError as exc:
+        assert exc.collection_name == "child_chunks_hybrid"
+    else:
+        raise AssertionError("expected CollectionNotReadyError")
+
+
+def test_module_answer_raises_no_context_retrieved_for_empty_source_items(monkeypatch) -> None:
+    runtime = SimpleNamespace()
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            return {"answer": "module-delegated", "source_items": []}
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.answer("hello", runtime))
+    except NoContextRetrievedError as exc:
+        assert exc.question == "hello"
+    else:
+        raise AssertionError("expected NoContextRetrievedError")
+
+
+def test_chat_service_wraps_missing_collection_as_collection_not_ready(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="child_chunks_hybrid"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise UnexpectedResponse(
+                status_code=404,
+                reason_phrase="Not Found",
+                content=b"{\"status\":{\"error\":\"Not found: Collection `child_chunks_hybrid` doesn't exist!\"}}",
+                headers={},
+            )
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.ChatService(runtime).answer(question="hello"))
+    except CollectionNotReadyError as exc:
+        assert exc.collection_name == "child_chunks_hybrid"
+    else:
+        raise AssertionError("expected CollectionNotReadyError")
+
+
+def test_module_answer_wraps_qdrant_errors_as_dependency_unavailable(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="collection"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise QdrantException("qdrant timeout")
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.answer("hello", runtime))
+    except DependencyUnavailableError as exc:
+        assert exc.dependency == "qdrant"
+        assert str(exc) == "Qdrant is unavailable"
+    else:
+        raise AssertionError("expected DependencyUnavailableError")
+
+
+def test_chat_service_wraps_qdrant_errors_as_dependency_unavailable(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="collection"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise QdrantException("qdrant timeout")
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.ChatService(runtime).answer(question="hello"))
+    except DependencyUnavailableError as exc:
+        assert exc.dependency == "qdrant"
+        assert str(exc) == "Qdrant is unavailable"
+    else:
+        raise AssertionError("expected DependencyUnavailableError")
+
+
+def test_module_answer_wraps_pymongo_errors_as_dependency_unavailable(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="collection"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise pymongo_errors.ServerSelectionTimeoutError("mongo down")
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.answer("hello", runtime))
+    except DependencyUnavailableError as exc:
+        assert exc.dependency == "mongodb"
+        assert str(exc) == "MongoDB is unavailable"
+    else:
+        raise AssertionError("expected DependencyUnavailableError")
+
+
+def test_chat_service_wraps_pymongo_errors_as_dependency_unavailable(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="collection"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise pymongo_errors.ServerSelectionTimeoutError("mongo down")
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.ChatService(runtime).answer(question="hello"))
+    except DependencyUnavailableError as exc:
+        assert exc.dependency == "mongodb"
+        assert str(exc) == "MongoDB is unavailable"
+    else:
+        raise AssertionError("expected DependencyUnavailableError")
+
+
+def test_module_answer_preserves_domain_errors(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="collection"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise NoContextRetrievedError("hello")
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.answer("hello", runtime))
+    except NoContextRetrievedError as exc:
+        assert exc.question == "hello"
+    else:
+        raise AssertionError("expected NoContextRetrievedError")
+
+
+def test_chat_service_preserves_domain_errors(monkeypatch) -> None:
+    runtime = SimpleNamespace(
+        storage_backend=SimpleNamespace(
+            qdrant_store=SimpleNamespace(collection_name="collection"),
+        ),
+    )
+
+    class FakeChatGraphService:
+        def __init__(self, runtime_arg):
+            assert runtime_arg is runtime
+
+        async def answer(self, **kwargs):
+            raise NoContextRetrievedError("hello")
+
+    monkeypatch.setattr(chat_service, "ChatGraphService", FakeChatGraphService)
+
+    try:
+        asyncio.run(chat_service.ChatService(runtime).answer(question="hello"))
+    except NoContextRetrievedError as exc:
+        assert exc.question == "hello"
+    else:
+        raise AssertionError("expected NoContextRetrievedError")
